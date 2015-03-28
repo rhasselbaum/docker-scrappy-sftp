@@ -1,0 +1,24 @@
+#!/bin/bash
+
+# Copies user and host credentials from "/etc" files and directories to the "/creds" volume.
+# This should be run whenever the source files change so they can be backed up.
+
+# Must run as root.
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root" 1>&2
+   exit 1
+fi
+
+if [ ! -d "/creds/ssh" ]; then
+  mkdir /creds/ssh
+fi
+
+if [ ! -d "/creds/users" ]; then
+  mkdir /creds/users
+fi
+
+# Copy SSH host keys.
+rsync -a /etc/ssh/ssh_host* /creds/ssh/
+
+# Copy user/group database
+rsync -a /etc/passwd /etc/group /etc/shadow /etc/subuid /etc/subgid /creds/users/

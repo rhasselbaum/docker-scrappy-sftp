@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+
+"""Watch user and group credential files for changes and when they change, export them to
+# the external volume.
+"""
+
+import subprocess
+import sys
+import threading
+import time
+import logging
+import os
+
+
+class ExportTask():
+    """"Checks periodically to see if an export is scheduled and runs it if so."""
+
+    def __init__(self):
+        """"Initialize."""
+        self._export_time = None
+        self._shutdown = False
+        self._lock = threading.Lock()
+        self._tick()
+
+    def schedule_export(self):
+        """"Called by any thread to schedule an expert sometime in the near future.
+
+        Each time this method is called, the export is deferred further into the future."""
+        with self._lock:
+            self._export_time = time.monotonic() + 5
+
+    def shutdown(self):
+        """Shutdown the task."""
+        with self._lock:
+            self._shutdown = True
+
+    def _tick(self):
+        """Checks to see if an export should occur now and perform one if so.
+
+        This method runs periodically."""
+        with self._lock:
+            if self._export_time and time.monotonic() > self._export_time:
+                subprocess.check_call(['exportcreds'])
+                logging.info('Exported credential files to container volume.')
+                self._export_time = None
+            if not self._shutdown:
+                threading.Timer(2, self._tick).start()
+
+
+if __name__ == "__main__":
+    # Init logging
+    prog_name = os.path.basename(sys.argv[0])
+    logging.basicConfig(format='%(asctime)s %(levelname)s {}: %(message)s'.format(prog_name), level=logging.DEBUG)
+    # Watch for file changes in "/etc" (indicated by "move_to" events) and output the filenames
+    WATCH_CMD = ['inotifywait', '-q', '--format', '%f', '-m', '-e', 'moved_to', '/etc']
+    proc = subprocess.Popen(WATCH_CMD, bufsize=1, universal_newlines=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    export_task = ExportTask()
+    try:
+        # Keep watching for file changes indefinitely (unless child process dies).
+        while proc.returncode is None:
+            line = proc.stdout.readline().strip()
+            if line in {'passwd', 'shadow', 'group', 'subuid', 'subgid'}:
+                # One of our files of interest has changed. Schedule export in the near future.
+                export_task.schedule_export()
+            proc.poll()
+        # Subprocess terminated unexpectedly.
+        (stdout, stderr) = proc.communicate()
+        error_msg = 'inotify subprocess terminated unexpectedly. Msg: {}'.format(stderr)
+        logging.error(error_msg)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        # If we are interrupted, kill the child as well.
+        proc.kill()
+    finally:
+        export_task.shutdown()

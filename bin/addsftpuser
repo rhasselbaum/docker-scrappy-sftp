@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Create a chroot jailed SFTP user.
+
+Usage (as root): addsftpuser <username>
+"""
+
+import os
+import sys
+from subprocess import check_call, call
+
+# Constants for directories, group names, and other file system stuff
+
+SFTP_ROOT_DIR = '/sftp-root'
+SFTP_GROUP = 'sftp'
+DATA_DIR = 'data'
+DEV_DIR = 'dev'
+
+# Start of script
+
+if len(sys.argv) != 2:
+    sys.exit('Usage: {} <username>'.format(sys.argv[0]))
+if os.geteuid() != 0:
+    sys.exit('Must run as root.')
+
+username = sys.argv[1]
+jail_root = SFTP_ROOT_DIR + '/' + username
+home_dir = jail_root + '/' + DATA_DIR
+jail_dev_dir = jail_root + '/' + DEV_DIR
+
+if call(['id', username]) == 0:
+    sys.exit('User {} already exists'.format(username))
+# Create jailed and home directories so skeleton files won't be copied into it.
+os.makedirs(home_dir)
+# Create dev dir for logging
+os.mkdir(jail_dev_dir)
+# Create user.
+check_call(['adduser', '--home', home_dir, '--shell', '/bin/false', '--ingroup', SFTP_GROUP, username])
+# Home directory should be owned by user and sftp group.
+check_call(['chown', '-R', username + ':' + SFTP_GROUP, home_dir])
+# Child files should inherit parent's group even if written to by a different user (like Amy).
+check_call(['chmod', '-R', 'u+rwx,g+rwxs', home_dir])
+# Reset home dir relative to jail root.
+check_call(['usermod', '--home', DATA_DIR, username])
+# Refresh hard links for logging under chroot jails
+check_call(['refreshchrootloglinks'])

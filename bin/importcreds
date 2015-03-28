@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Copies user and host credentials from a mount to corresponding "/etc" files and directories.
+# This should be run once as root at container startup to import users and host keys from
+# external storage.
+
+# Must run as root.
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root" 1>&2
+   exit 1
+fi
+
+# Replace SSH host keys if they exist in external storage.
+if [ -d "/creds/ssh" ]; then
+  rsync -a /creds/ssh/ssh_host* /etc/ssh/
+fi
+
+# Replace user/group database
+if [ -d "/creds/users" ]; then
+  rsync -a /creds/users/* /etc/
+fi

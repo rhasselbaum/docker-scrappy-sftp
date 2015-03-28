@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Set up required environment for SFTP.
+
+# Must run as root.
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root" 1>&2
+   exit 1
+fi
+
+# Make sure directory exists for log socket
+if [ ! -d "/sftp-root/dev" ]; then
+  mkdir /sftp-root/dev
+fi
+
+# Regenerate SSH server key if we haven't already.
+if [ ! -f "/etc/ssh/.containerkeys" ]; then
+  echo "Creating new SSH host keys ..."
+  rm /etc/ssh/ssh_host_*
+  dpkg-reconfigure openssh-server
+  touch /etc/ssh/.containerkeys
+fi
+
+# Import user/group database and host credentials from external storage if available.
+importcreds
+
+exec "$@"

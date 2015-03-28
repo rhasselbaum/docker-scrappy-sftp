@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+
+"""Listens to log traffic from OpenSSH's "internal-sftp" subsystem on a socket
+and generates one transfer log per session, which it then emails.
+
+Input received on the socket is relayed to standard output. This script relies
+on a helper (refreshchrootloglinks), which creates hard links from each user's
+chroot jail to the shared log socket.
+
+This script must run as root, but drops privileges once its sockets are set up.
+
+The 'MAIL_TO' environment variable sets the destination for emailed transfer
+logs. If unset. no emails are sent but the SFTP logs are relayed to
+standard output for monitoring. A 'MAIL_FROM' environment variable can be set,
+as well, to specify the FROM address. If left unset, 'root' is used.
+"""
+
+import sys
+import re
+import os
+import time
+from email.mime.text import MIMEText
+import socketserver
+import subprocess
+from subprocess import PIPE
+import pwd
+import grp
+import logging
+import threading
+import queue
+
+
+# Environment settings and constants.
+UNIX_SOCKET = '/sftp-root/dev/log'
+REFRESH_CHROOT_LOG_LINKS_CMD = ['refreshchrootloglinks']
+MAIL_CMD = ['sendmail']
+UNPRIV_USER = 'nobody'
+UNPRIV_GROUP = 'nogroup'
+MAX_MESSAGES = 5000
+MAX_EMAIL_THREADS = 3
+LOG_LEVEL = logging.INFO
+
+
+# FUNCTIONS
+
+def send_xfer_log(pid, username, host, uploads_summary, downloads_summary, deletes_summary,
+                  mail_to, mail_from):
+    """Queue delivery of an email report for a single session's activity.
+
+    The PID identifies the session. Username and host are the remote SFTP user's details.
+    The summary parameters provide text summaries of each kind of action the user took
+    during the session. The mail_to parameter specifies the email recipient and mail_from
+    is the FROM address.
+    """
+
+    # Generate the message body and envelope.
+    body = 'SFTP activity of {} connecting from {}:\n\n'.format(username, host)
+    body += uploads_summary + downloads_summary + deletes_summary
+    body += '\nSession {} finished on {}'.format(pid, time.strftime('%a, %d %b %Y %I:%M %p'))
+    msg = MIMEText(body)
+    msg['Subject'] = 'SFTP session {} with {}'.format(pid, username)
+    msg['From'] = mail_from
+    msg['To'] = mail_to
+    logging.debug('Queueing message for delivery.\n{}'.format(msg.as_string()))
+    email_pump.enqueue_msg(mail_to, msg, pid, username)
+
+
+def drop_privileges():
+    """"Drop privileges from root to an unprivileged user to run the server."""
+    # Get the uid/gid from the name
+    running_uid = pwd.getpwnam(UNPRIV_USER).pw_uid
+    running_gid = grp.getgrnam(UNPRIV_GROUP).gr_gid
+
+    # Remove group privileges
+    os.setgroups([])
+
+    # Try setting the new uid/gid
+    os.setgid(running_gid)
+    os.setuid(running_uid)
+
+# CLASSES
+
+
+class Session:
+    """A simple session structure."""
+
+    def __init__(self):
+        # Upload messages
+        self.uploads = []
+        # Download messages
+        self.downloads = []
+        # File delete messages
+        self.deletes = []
+
+
+class EmailPump:
+    """Queues transfer log emails for delivery and delivers them in async worker threads."""
+    def __init__(self):
+        """Create a queue for email messages to be delivered and a group of daemon worker threads
+        to consume messages from the queue and dispatch emails through sendmail."""
+        self._queue = queue.Queue()
+        for i in range(MAX_EMAIL_THREADS):
+            t = threading.Thread(target=self._run)
+            t.daemon = True
+            t.start()
+
+    def shutdown(self):
+        """Wait until the queue has been drained and then return."""
+        self._queue.join()
+
+    def enqueue_msg(self, mail_to, message, pid, username):
+        """Enqueue an email to be sent.
+
+        The mail_to argument is the recipient email address and the message is a MIMEText object.
+        The PID and SFTP username are logged."""
+        self._queue.put((mail_to, message, pid, username))
+
+    def _run(self):
+        """Consumes messages from the queue indefinitely.
+
+        For each message received, an email is dispatched through sendmail."""
+        while True:
+            (mail_to, message, pid, username) = self._queue.get()
+            logging.debug('Email pump received message for delivery.')
+            proc = subprocess.Popen(MAIL_CMD + [mail_to], stdin=PIPE, stdout=PIPE, stderr=subprocess.STDOUT,
+                                    universal_newlines=True)
+            cmd_output = proc.communicate(input=message.as_string())[0].strip()
+            if proc.returncode:
+                logging.error('Cannot send email to {} for session {}: {}'.format(mail_to, pid, cmd_output))
+            else:
+                logging.info("Sent transfer log to {} for session {} with {}.".format(mail_to, pid, username))
+            self._queue.task_done()
+
+
+class SftpMailerRequestHandler(socketserver.BaseRequestHandler):
+    """Implements the datagram listener."""
+
+    # Dictionary of open self.sessions indexed by process ID (pid)
+    sessions = {}
+
+    def handle(self):
+        """Consumes line input from datagrams.
+
+        A datagram should consist of one or more complete log lines, which are processed here.
+        """
+
+        lines = self.request[0].decode(encoding='UTF-8').splitlines()
+        for line in lines:
+            sys.stdout.write(line + '\n')
+            self.process_line(line)
+
+    def process_line(self, line):
+        """Validate that a given line of log data has the expected format and parse the message.
+
+        We parse the line to pull out common headers if we can, then pass the message on for processing.
+        """
+
+        # The following regex matches a log line of the form:
+        # <headers> internal-sftp[<pid>]: <message>
+        # There are three capture groups that capture the headers, pid, and message, respectively.
+        valid_line = re.search('.*\s+internal-sftp\[(\d+)\]:\s+(.*)', line)
+        if valid_line:
+            pid = valid_line.group(1)
+            message = valid_line.group(2)
+            self.process_message(pid, message)
+
+    def process_message(self, pid, message):
+        """Given a valid log message, identify its type and dispatch to an appropriate handler
+        for further processing.
+
+        The headers are not currently used and can contain anything. The pid parameter identifies
+        the session and is used as a key to group related log messages. The message is the bit
+        we're trying to parse.
+        """
+
+        # The following regex matches a log line of the form:
+        # close <filename> bytes read <read_bytes> written <write_bytes>
+        # There are three capture groups for the filename, bytes read, and bytes written, respectively.
+        xfer_msg = re.search('close (.*) bytes read (\d+) written (\d+)', message)
+        if xfer_msg:
+            self.process_file_xfer_msg(pid, xfer_msg.group(1), int(xfer_msg.group(2)), int(xfer_msg.group(3)))
+        # The following regex matches a log line of the form:
+        # remove name <filename>
+        # There is one capture group for the filename.
+        remove_msg = re.search('remove name (.*)', message)
+        if remove_msg:
+            self.process_file_remove_msg(pid, remove_msg.group(1))
+        # The following regex matches a log line of the form:
+        # session closed [...] user <username> from [<host>]
+        # There are two capture groups for the username and host, respectively.
+        session_close_msg = re.search('session closed.*user (.*) from \[(.*)\]', message)
+        if session_close_msg:
+            self.process_session_close_msg(pid, session_close_msg.group(1), session_close_msg.group(2))
+
+    def process_file_remove_msg(self, pid, filename):
+        """Records a file delete action in the session object.
+
+        The PID identifies the session and the filename is the file that the user deleted from the server.
+        We cap the number of delete entries tracked in the session so one session doesn't exhaust
+        available memory.
+        """
+        session = self.create_or_get_session(pid)
+        if len(session.deletes) < MAX_MESSAGES:
+            session.deletes += [filename]
+        elif len(session.deletes) == MAX_MESSAGES:
+            session.deletes += ['...and more...']
+
+    def process_session_close_msg(self, pid, username, host):
+        """At the end of a session, generate report text from the actions recorded in the session data
+        structure and send it via email if and only if the MAIL_TO environment variable has been set.
+
+        The PID identifies the session and the username is the SFTP user. Host is the remote host IP
+        address. Once the session closed message has been processed, the session object associated
+        with the PID is removed. If the 'MAIL_TO' environment variable is not set, this metho does nothing.
+        The 'MAIL_FROM' environment variable can also be set to specify the FROM address.
+        """
+
+        mail_to = os.getenv('MAIL_TO')
+        # Get session (if any) from the local session dictionary, indexed by pid.
+        if mail_to and pid in self.sessions:
+            session = self.sessions[pid]
+            uploads_summary = ''
+            if session.uploads:
+                uploads_summary = 'UPLOADS\n  ' + '\n  '.join(session.uploads) + '\n'
+            downloads_summary = ''
+            if session.downloads:
+                downloads_summary = 'DOWNLOADS\n  ' + '\n  '.join(session.downloads) + '\n'
+            deletes_summary = ''
+            if session.deletes:
+                deletes_summary = 'REMOVED\n  ' + '\n  '.join(session.deletes) + '\n'
+
+            if session.uploads or session.downloads or session.deletes:
+                send_xfer_log(pid, username, host, uploads_summary, downloads_summary, deletes_summary,
+                              mail_to, os.getenv('MAIL_FROM', 'root'))
+            del self.sessions[pid]
+
+    def process_file_xfer_msg(self, pid, filename, read_bytes, write_bytes):
+        """Record a file upload or download action in the session object.
+
+        The PID identifies the session. The filename is the name of the file (big surprise).
+        Only one of bytes read or written should be greater than 0, the other should be 0.
+        The non-zero value indicates whether the file was uploaded or downloaded. We cap the
+        number of transfer entries tracked in the session so one session doesn't exhaust
+        available memory.
+        """
+
+        # Create or update session from the local session dictionary, indexed by pid.
+        session = self.create_or_get_session(pid)
+        if read_bytes or write_bytes:
+            xfer_bytes = read_bytes if read_bytes else write_bytes
+            msg_list = session.downloads if read_bytes else session.uploads
+            if len(msg_list) < MAX_MESSAGES:
+                msg_list += [filename + ' (' + str(xfer_bytes) + ' bytes)']
+            elif len(msg_list) == MAX_MESSAGES:
+                msg_list += ['...and more...']
+
+    def create_or_get_session(self, pid):
+        """"Return a session object for the given PID or create a new one."""
+
+        if pid in self.sessions:
+            session = self.sessions[pid]
+        else:
+            session = Session()
+            self.sessions[pid] = session
+        return session
+
+# SCRIPT
+
+email_pump = EmailPump()
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit('Must run as root.')
+    prog_name = os.path.basename(sys.argv[0])
+    logging.basicConfig(format='%(asctime)s %(levelname)s {}: %(message)s'.format(prog_name), level=LOG_LEVEL)
+    if os.path.exists(UNIX_SOCKET):
+        os.remove(UNIX_SOCKET)
+    server = socketserver.UnixDatagramServer(UNIX_SOCKET, SftpMailerRequestHandler)
+    os.chmod(UNIX_SOCKET, 0o666)
+    subprocess.check_call(REFRESH_CHROOT_LOG_LINKS_CMD)
+    drop_privileges()
+    logging.info('Dropped privileges and started listening on socket: %s', UNIX_SOCKET)
+    try:
+        server.serve_forever()
+    except (KeyboardInterrupt, SystemExit):
+        logging.info('Shutting down.')
+    finally:
+        email_pump.shutdown()
