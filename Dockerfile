@@ -29,6 +29,7 @@ RUN sed -e 's|\(Subsystem sftp \).*|\1internal-sftp -l INFO|' -i /etc/ssh/sshd_c
  echo '    X11Forwarding no' >>/etc/ssh/sshd_config && \
  echo '    AllowTcpForwarding no' >>/etc/ssh/sshd_config && \
  echo '    ChrootDirectory /sftp-root/%u' >>/etc/ssh/sshd_config && \
+ echo '    AuthorizedKeysFile /sftp-root/%u/.ssh/authorized_keys' >>/etc/ssh/sshd_config && \
  echo '    ForceCommand internal-sftp -l INFO' >>/etc/ssh/sshd_config && \
  # Make all files group writeable so they can be modified by either sftpadmin or the unprivileged users.
  echo '\n# UMask for chrooted SFTP users\nsession optional pam_umask.so umask=002' >>/etc/pam.d/sshd
