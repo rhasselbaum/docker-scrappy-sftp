@@ -60,7 +60,7 @@ Neat! But we should really change the `sftpadmin` user's password, which we can 
 docker exec -it sftp passwd sftpadmin
 ```
 
-The same command can be used to change any other user's password. All of the users are regular local Linux users, so they can be managed through the standard utilities executed via `docker exec`. When you're done experimenting, you can hit CTRL-C in the terminal that started the Scrappy SFTP container to shut it down and clear out the test data.
+The same command can be used to change any other user's password. All of the users are regular local Linux users, so they can be managed through the standard utilities executed via `docker exec`. Alternatively, you can use public key authentication by placing a `.ssh/authorized_keys` file with appropriate permissions in a user's home directory. When you're done experimenting, you can hit CTRL-C in the terminal that started the Scrappy SFTP container to shut it down and clear out the test data.
 
 If you just want a small server and you're not concerned about backups or emailed transfer logs, you can start up a _permanent_ container by adjusting the Docker parameters to run Scrappy SFTP in the background:
 
@@ -157,7 +157,6 @@ These options support external storage for files and the user database, as well 
 Scrappy SFTP works well for a population of a few dozen to a couple hundred semi-trusted users. It partitions user data directories with chroot and sets appropriate file permissions, but it is not well-suited for completely untrusted users or high traffic volumes. Here are some limitations I'd like to address in the future:
 
 * Per user limits on number of sessions, transfers, and storage capacity
-* Support for public key authentication instead of passwords
 * Retry mechanism for failed email attempts
 
 Want to help? Pull requests welcome!
